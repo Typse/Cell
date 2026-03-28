@@ -61,6 +61,7 @@ local UnitPhaseReason = UnitPhaseReason
 local IsInRaid = IsInRaid
 local UnitDetailedThreatSituation = UnitDetailedThreatSituation
 local GetAuraDataByAuraInstanceID = C_UnitAuras.GetAuraDataByAuraInstanceID
+local GetDebuffDataByIndex = C_UnitAuras.GetDebuffDataByIndex
 local GetAuraSlots = C_UnitAuras.GetAuraSlots
 local GetAuraDataBySlot = C_UnitAuras.GetAuraDataBySlot
 local IsDelveInProgress = C_PartyInfo.IsDelveInProgress
@@ -1210,7 +1211,7 @@ local function HandleDebuff(self, auraInfo)
 
         if enabledIndicators["debuffs"] and not isBlacklisted then
             -- all debuffs / only dispellableByMe
-            if not indicatorBooleans["debuffs"] or I.CanDispel(debuffType) then
+            if not indicatorBooleans["debuffs"] or (Cell.isMidnight and self._midnightDispelsActive) or I.CanDispel(debuffType) then
                 if isBig then
                     self._debuffs_big[auraInstanceID] = true
                 else
@@ -1238,7 +1239,7 @@ local function HandleDebuff(self, auraInfo)
             end
         end
 
-        if enabledIndicators["dispels"] and debuffType and debuffType ~= "" then
+        if not Cell.isMidnight and enabledIndicators["dispels"] and debuffType and debuffType ~= "" then
             -- all dispels / only dispellableByMe
             if not indicatorBooleans ["dispels"]["dispellableByMe"] or I.CanDispel(debuffType) then
                 if indicatorBooleans["dispels"][debuffType] then
@@ -1284,6 +1285,91 @@ local function HandleDebuff(self, auraInfo)
     end
 end
 
+local function ScanMidnightDispels(self)
+    wipe(self._debuffs_dispellable)
+    wipe(self._debuffs_dispel)
+
+    if not (Cell.isMidnight and GetDebuffDataByIndex) then return end
+
+    local unit = self.states.displayedUnit
+    if not unit then return end
+
+    local dispelsEnabled = enabledIndicators["dispels"]
+    local allowUnknownDispel = dispelsEnabled and (
+        indicatorBooleans["dispels"]["Magic"]
+        or indicatorBooleans["dispels"]["Curse"]
+        or indicatorBooleans["dispels"]["Disease"]
+        or indicatorBooleans["dispels"]["Poison"]
+        or indicatorBooleans["dispels"]["Bleed"]
+    )
+    local debuffsDispellableOnly = enabledIndicators["debuffs"] and indicatorBooleans["debuffs"]
+    if not (dispelsEnabled or debuffsDispellableOnly) then return end
+
+    local index = 1
+    local hasUnknownDispel
+
+    while true do
+        local auraInfo = GetDebuffDataByIndex(unit, index, "RAID_PLAYER_DISPELLABLE")
+        if not auraInfo then break end
+
+        if auraInfo.auraInstanceID then
+            self._debuffs_dispellable[auraInfo.auraInstanceID] = true
+        end
+
+        if dispelsEnabled then
+            local spellId = auraInfo.spellId
+            local isDispelBlacklisted = false
+            if F.IsAuraNonSecret(auraInfo) then
+                isDispelBlacklisted = spellId and Cell.vars.dispelBlacklist[spellId] or false
+            end
+
+            if not isDispelBlacklisted then
+                local dispelType = F.ResolveDispelType(auraInfo)
+                local secretColor = F.GetSecretSafeDispelColor(unit, auraInfo.auraInstanceID)
+
+                if dispelType and dispelType ~= "" then
+                    if indicatorBooleans["dispels"][dispelType] then
+                        self._debuffs_dispel[dispelType] = {
+                            showHighlight = true,
+                            showIcon = true,
+                            knownType = true,
+                            color = secretColor,
+                        }
+                    end
+                elseif allowUnknownDispel and not hasUnknownDispel then
+                    self._debuffs_dispel["_unknown"] = {
+                        showHighlight = true,
+                        showIcon = false,
+                        knownType = false,
+                        color = secretColor,
+                    }
+                    hasUnknownDispel = true
+                end
+            end
+        end
+
+        index = index + 1
+    end
+end
+
+local function FilterMidnightDispellableDebuffs(self)
+    if not (Cell.isMidnight and enabledIndicators["debuffs"] and indicatorBooleans["debuffs"]) then
+        return
+    end
+
+    for auraInstanceID in next, self._debuffs_big do
+        if not self._debuffs_dispellable[auraInstanceID] then
+            self._debuffs_big[auraInstanceID] = nil
+        end
+    end
+
+    for auraInstanceID in next, self._debuffs_normal do
+        if not self._debuffs_dispellable[auraInstanceID] then
+            self._debuffs_normal[auraInstanceID] = nil
+        end
+    end
+end
+
 local RAID_DEBUFFS_GLOW_TYPES = {"Normal", "Pixel", "Shine", "Proc"}
 
 local function UnitButton_UpdateDebuffs(self, isFullUpdate)
@@ -1291,12 +1377,18 @@ local function UnitButton_UpdateDebuffs(self, isFullUpdate)
 
     ResetDebuffVars(self)
     I.ResetCustomIndicators(self, "debuff")
+    self._midnightDispelsActive = Cell.isMidnight and enabledIndicators["debuffs"] and indicatorBooleans["debuffs"] or false
 
     if isFullUpdate then
         wipe(self._debuffs_cache)
         ForEachAura(self, "HARMFUL", HandleDebuff)
     else
         ForEachAuraCache(self, "HARMFUL", HandleDebuff)
+    end
+
+    if Cell.isMidnight then
+        ScanMidnightDispels(self)
+        FilterMidnightDispellableDebuffs(self)
     end
 
     if not self._debuffs.resurrectionFound then
@@ -1643,7 +1735,8 @@ local function InitAuraTables(self)
     -- debuffs
     self._debuffs_normal = {} -- [auraInstanceID] = refreshing
     self._debuffs_big = {} -- [auraInstanceID] = refreshing
-    self._debuffs_dispel = {} -- [debuffType] = true/false
+    self._debuffs_dispel = {} -- [debuffType] = true/false/table
+    self._debuffs_dispellable = {} -- [auraInstanceID] = true
     self._debuffs_raid = {} -- {id1, id2, ...}
     self._debuffs_glow_current = {}
 end
@@ -1657,6 +1750,7 @@ local function ResetAuraTables(self)
     wipe(self._debuffs_normal)
     wipe(self._debuffs_big)
     wipe(self._debuffs_dispel)
+    wipe(self._debuffs_dispellable)
     wipe(self._debuffs_raid)
 
     -- raid debuffs glow
@@ -2576,6 +2670,9 @@ UnitButton_UpdateShieldAbsorbs = function(self, skipStateUpdates)
             -- NOTE: indicatorBooleans["shieldBar"] (onlyShowOvershields) can't be honored with
             -- secrets since we can't compute overshieldPercent. Show full absorbs instead.
             self.indicators.shieldBar:Show()
+            if self.indicators.shieldBar.SetMinMaxValues then
+                self.indicators.shieldBar:SetMinMaxValues(0, self.widgets.healthCalculator:GetMaximumHealth())
+            end
             self.indicators.shieldBar:SetValue(absorbs)
         else
             self.indicators.shieldBar:Hide()

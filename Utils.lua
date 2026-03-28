@@ -2564,3 +2564,40 @@ function F.IsValueNonSecret(val)
     if not issecretvalue then return true end
     return not issecretvalue(val)
 end
+
+function F.CanComputeHealthMath(health, maxHealth, absorbs, healAbsorbs)
+    return F.IsValueNonSecret(health)
+        and F.IsValueNonSecret(maxHealth)
+        and F.IsValueNonSecret(absorbs)
+        and F.IsValueNonSecret(healAbsorbs)
+end
+
+function F.CanComputePowerMath(power, powerMax)
+    return F.IsValueNonSecret(power) and F.IsValueNonSecret(powerMax)
+end
+
+function F.UseSecretSafeHealthText(health, maxHealth, absorbs, healAbsorbs)
+    return Cell.isMidnight and not F.CanComputeHealthMath(health, maxHealth, absorbs, healAbsorbs)
+end
+
+function F.ResolveDispelType(auraInfo)
+    if not auraInfo then return end
+
+    local dispelType = auraInfo.dispelName
+    if F.IsSecretValue(dispelType) then
+        dispelType = nil
+    end
+
+    return I.CheckDebuffType(dispelType or "", auraInfo.spellId)
+end
+
+function F.GetSecretSafeDispelColor(unit, auraInstanceID, curve)
+    if not (Cell.isMidnight and unit and auraInstanceID and C_UnitAuras and C_UnitAuras.GetAuraDispelTypeColor) then
+        return
+    end
+
+    local ok, color = pcall(C_UnitAuras.GetAuraDispelTypeColor, unit, auraInstanceID, curve)
+    if ok then
+        return color
+    end
+end

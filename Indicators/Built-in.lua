@@ -11,6 +11,12 @@ local P = Cell.pixelPerfectFuncs
 
 local LCG = LibStub("LibCustomGlow-1.0")
 local LibTranslit = LibStub("LibTranslit-1.0")
+local UnitHealthMissing = UnitHealthMissing
+local UnitHealthPercent = UnitHealthPercent
+local UnitPowerPercent = UnitPowerPercent
+local CurveConstants = CurveConstants
+local CreateCurve = C_CurveUtil and C_CurveUtil.CreateCurve
+local AbbreviateNumbers = AbbreviateNumbers
 
 local function noop() end
 
@@ -580,19 +586,33 @@ end
 
 local dispelOrder = {"Magic", "Curse", "Disease", "Poison", "Bleed"}
 local function Dispels_SetDispels(self, dispelTypes)
-    local r, g, b = 0, 0, 0
     local found
+    local fallbackHighlight = dispelTypes["_unknown"]
 
     self.highlight:Hide()
 
     local i = 0
     for _, dispelType in ipairs(dispelOrder) do
-        local showHighlight = dispelTypes[dispelType]
+        local dispelData = dispelTypes[dispelType]
+        local showHighlight, showIcon, r, g, b
+        if type(dispelData) == "boolean" then
+            showHighlight = dispelData
+            showIcon = dispelData
+            r, g, b = I.GetDebuffTypeColor(dispelType)
+        elseif type(dispelData) == "table" then
+            showHighlight = dispelData.showHighlight
+            showIcon = dispelData.showIcon
+            if dispelData.color and dispelData.color.GetRGBA then
+                r, g, b = dispelData.color:GetRGBA()
+            else
+                r, g, b = I.GetDebuffTypeColor(dispelType)
+            end
+        end
+
         if type(showHighlight) == "boolean" then
             -- highlight
             if not found and self.highlightType ~= "none" and dispelType and showHighlight then
                 found = true
-                local r, g, b = I.GetDebuffTypeColor(dispelType)
                 if self.highlightType == "entire" then
                     self.highlight:SetTexture(Cell.vars.whiteTexture)
                     self.highlight:SetVertexColor(r, g, b, 0.5)
@@ -606,11 +626,31 @@ local function Dispels_SetDispels(self, dispelTypes)
                 self.highlight:Show()
             end
             -- icons
-            if self.showIcons then
+            if self.showIcons and showIcon then
                 i = i + 1
                 self[i]:SetDispel(dispelType)
             end
         end
+    end
+
+    if not found and self.highlightType ~= "none" and type(fallbackHighlight) == "table" and fallbackHighlight.showHighlight then
+        local r, g, b = I.GetDebuffTypeColor("Magic")
+        if fallbackHighlight.color and fallbackHighlight.color.GetRGBA then
+            r, g, b = fallbackHighlight.color:GetRGBA()
+        end
+
+        if self.highlightType == "entire" then
+            self.highlight:SetTexture(Cell.vars.whiteTexture)
+            self.highlight:SetVertexColor(r, g, b, 0.5)
+        elseif self.highlightType == "current" or self.highlightType == "current+" then
+            self.highlight:SetTexture(Cell.vars.texture)
+            self.highlight:SetVertexColor(r, g, b, 1)
+        elseif self.highlightType == "gradient" or self.highlightType == "gradient-half" then
+            self.highlight:SetTexture(Cell.vars.whiteTexture)
+            self.highlight:SetGradient("VERTICAL", CreateColor(r, g, b, 1), CreateColor(r, g, b, 0))
+        end
+
+        self.highlight:Show()
     end
 
     self:UpdateSize(i)
@@ -1543,10 +1583,15 @@ local function BuildPattern(config)
 end
 
 local function HealthText_SetFormat(self, format)
-    self.GetHealth1 = formatter[format.health1.format:gsub("_no_sign$", "")]
-    self.GetHealth2 = formatter[format.health2.format:gsub("_no_sign$", "")]
-    self.GetShields = formatter[format.shields.format:gsub("_no_sign$", "")]
-    self.GetHealAbsorbs = formatter[format.healAbsorbs.format:gsub("_no_sign$", "")]
+    self.health1Format = format.health1.format:gsub("_no_sign$", "")
+    self.health2Format = format.health2.format:gsub("_no_sign$", "")
+    self.shieldsFormat = format.shields.format:gsub("_no_sign$", "")
+    self.healAbsorbsFormat = format.healAbsorbs.format:gsub("_no_sign$", "")
+
+    self.GetHealth1 = formatter[self.health1Format]
+    self.GetHealth2 = formatter[self.health2Format]
+    self.GetShields = formatter[self.shieldsFormat]
+    self.GetHealAbsorbs = formatter[self.healAbsorbsFormat]
 
     self.health1 = BuildPattern(format.health1)
     self.health1_hideIfEmptyOrFull = format.health1.hideIfEmptyOrFull
@@ -1556,15 +1601,102 @@ local function HealthText_SetFormat(self, format)
     self.healAbsorbs = BuildPattern(format.healAbsorbs)
 end
 
+local secretDeficitPercentCurve
+local function GetSecretDeficitPercentCurve()
+    if secretDeficitPercentCurve or not CreateCurve then return secretDeficitPercentCurve end
+
+    secretDeficitPercentCurve = CreateCurve()
+    secretDeficitPercentCurve:AddPoint(0, 100)
+    secretDeficitPercentCurve:AddPoint(1, 0)
+
+    return secretDeficitPercentCurve
+end
+
+local function FormatSecretTextValue(pattern, value, abbreviated)
+    if value == nil then return "" end
+
+    if abbreviated then
+        value = AbbreviateNumbers and AbbreviateNumbers(value) or tostring(value)
+    end
+
+    return pattern:format(value)
+end
+
+local function UpdateTextContainerWidth(self)
+    if Cell.isMidnight then return end
+    self:SetWidth(self.text:GetStringWidth())
+end
+
+local function UpdateTextContainerFontSize(self, size)
+    if Cell.isMidnight then
+        self:SetSize(math.max(self:GetWidth(), 1), size)
+    else
+        self:SetSize(self.text:GetStringWidth(), size)
+    end
+end
+
+local function BuildSecretHealthTextPart(self, formatName, pattern, health, maxHealth, shields, healAbsorbs)
+    if pattern == "" or formatName == "none" then return "" end
+
+    local button = self.unitButton
+    local unit = button and button.states and button.states.displayedUnit
+    if not unit then return "" end
+
+    if formatName == "health" then
+        return FormatSecretTextValue(pattern, health)
+    elseif formatName == "health_short" then
+        return FormatSecretTextValue(pattern, health, true)
+    elseif formatName == "health_percent" then
+        if UnitHealthPercent and CurveConstants and CurveConstants.ScaleTo100 then
+            return FormatSecretTextValue(pattern, UnitHealthPercent(unit, true, CurveConstants.ScaleTo100))
+        end
+    elseif formatName == "deficit" then
+        if UnitHealthMissing then
+            return FormatSecretTextValue(pattern, UnitHealthMissing(unit))
+        end
+    elseif formatName == "deficit_short" then
+        if UnitHealthMissing then
+            return FormatSecretTextValue(pattern, UnitHealthMissing(unit), true)
+        end
+    elseif formatName == "deficit_percent" then
+        local curve = GetSecretDeficitPercentCurve()
+        if UnitHealthPercent and curve then
+            return FormatSecretTextValue(pattern, UnitHealthPercent(unit, true, curve))
+        end
+    elseif formatName == "effective" then
+        return FormatSecretTextValue(pattern, health)
+    elseif formatName == "effective_short" then
+        return FormatSecretTextValue(pattern, health, true)
+    elseif formatName == "effective_percent" then
+        if UnitHealthPercent and CurveConstants and CurveConstants.ScaleTo100 then
+            return FormatSecretTextValue(pattern, UnitHealthPercent(unit, true, CurveConstants.ScaleTo100))
+        end
+    elseif formatName == "shields" then
+        return FormatSecretTextValue(pattern, shields)
+    elseif formatName == "shields_short" then
+        return FormatSecretTextValue(pattern, shields, true)
+    elseif formatName == "healabsorbs" then
+        return FormatSecretTextValue(pattern, healAbsorbs)
+    elseif formatName == "healabsorbs_short" then
+        return FormatSecretTextValue(pattern, healAbsorbs, true)
+    end
+
+    return ""
+end
+
 local function HealthText_SetValue(self, health, maxHealth, shields, healAbsorbs)
     -- On Midnight 12.0.0+, health/maxHealth may be secret values in restricted contexts.
     -- Arithmetic (/, *, -, comparison) on secret values causes errors.
-    -- AbbreviateNumbers() and FontString:SetText() accept secret values safely.
-    -- DO NOT divide, multiply, or compare secret values.
-    if Cell.isMidnight and F.IsAuraRestricted and F.IsAuraRestricted() then
-        local healthStr = AbbreviateNumbers and AbbreviateNumbers(health) or tostring(health)
-        self.text:SetText(healthStr)
-        self:SetWidth(self.text:GetStringWidth())
+    -- Match VuhDo's Midnight approach: switch to a dedicated secret-safe text path
+    -- using native WoW APIs (UnitHealthPercent/UnitHealthMissing/AbbreviateNumbers).
+    if F.UseSecretSafeHealthText and F.UseSecretSafeHealthText(health, maxHealth, shields, healAbsorbs) then
+        self.text:SetText(("%s%s%s%s"):format(
+            BuildSecretHealthTextPart(self, self.health1Format, self.health1, health, maxHealth, shields, healAbsorbs),
+            BuildSecretHealthTextPart(self, self.health2Format, self.health2, health, maxHealth, shields, healAbsorbs),
+            BuildSecretHealthTextPart(self, self.shieldsFormat, self.shields, health, maxHealth, shields, healAbsorbs),
+            BuildSecretHealthTextPart(self, self.healAbsorbsFormat, self.healAbsorbs, health, maxHealth, shields, healAbsorbs)
+        ))
+        UpdateTextContainerWidth(self)
         return
     end
 
@@ -1575,7 +1707,7 @@ local function HealthText_SetValue(self, health, maxHealth, shields, healAbsorbs
         self.GetHealth2(self.health2, self.health2_hideIfEmptyOrFull, health, maxHealth, shields, healAbsorbs),
         self.GetShields(self.shields, health, maxHealth, shields, healAbsorbs),
         self.GetHealAbsorbs(self.healAbsorbs, health, maxHealth, shields, healAbsorbs))
-    self:SetWidth(self.text:GetStringWidth())
+    UpdateTextContainerWidth(self)
 end
 
 local function HealthText_SetFont(self, font, size, outline, shadow)
@@ -1600,7 +1732,7 @@ local function HealthText_SetFont(self, font, size, outline, shadow)
         self.text:SetShadowColor(0, 0, 0, 0)
     end
 
-    self:SetSize(self.text:GetStringWidth(), size)
+    UpdateTextContainerFontSize(self, size)
 end
 
 local function HealthText_SetPoint(self, point, relativeTo, relativePoint, x, y)
@@ -1632,6 +1764,7 @@ function I.CreateHealthText(parent)
     local healthText = CreateFrame("Frame", parent:GetName().."HealthText", parent.widgets.indicatorFrame)
     parent.indicators.healthText = healthText
     healthText:Hide()
+    healthText.unitButton = parent
 
     local text = healthText:CreateFontString(nil, "OVERLAY", "CELL_FONT_STATUS")
     healthText.text = text
@@ -1640,6 +1773,10 @@ function I.CreateHealthText(parent)
     healthText.GetHealth2 = formatter.none
     healthText.GetShields = formatter.none
     healthText.GetHealAbsorbs = formatter.none
+    healthText.health1Format = "none"
+    healthText.health2Format = "none"
+    healthText.shieldsFormat = "none"
+    healthText.healAbsorbsFormat = "none"
 
     healthText.SetFont = HealthText_SetFont
     healthText._SetPoint = healthText.SetPoint
@@ -1654,31 +1791,61 @@ end
 -- power text
 -------------------------------------------------
 local function SetPower_Percentage(self, current, max)
+    if Cell.isMidnight and F.CanComputePowerMath and not F.CanComputePowerMath(current, max) then
+        local button = self.unitButton
+        local unit = button and button.states and button.states.displayedUnit
+        local powerType = button and button.states and button.states.powerType or 0
+        if unit and UnitPowerPercent and CurveConstants and CurveConstants.ScaleTo100 then
+            local ok, percent = pcall(UnitPowerPercent, unit, powerType, false, CurveConstants.ScaleTo100)
+            if ok and percent ~= nil then
+                self.text:SetFormattedText("%d%%", percent)
+            else
+                self.text:SetText(current)
+            end
+        else
+            self.text:SetText(current)
+        end
+        self:Show()
+        return
+    end
+
     if self.hideIfEmptyOrFull and (current == 0 or current == max) then
         self:Hide()
     else
         self.text:SetFormattedText("%d%%", current/max*100)
-        self:SetWidth(self.text:GetStringWidth())
+        UpdateTextContainerWidth(self)
         self:Show()
     end
 end
 
 local function SetPower_Number(self, current, max)
+    if Cell.isMidnight and F.CanComputePowerMath and not F.CanComputePowerMath(current, max) then
+        self.text:SetText(current)
+        self:Show()
+        return
+    end
+
     if self.hideIfEmptyOrFull and (current == 0 or current == max) then
         self:Hide()
     else
         self.text:SetText(current)
-        self:SetWidth(self.text:GetStringWidth())
+        UpdateTextContainerWidth(self)
         self:Show()
     end
 end
 
 local function SetPower_Number_Short(self, current, max)
+    if Cell.isMidnight and F.CanComputePowerMath and not F.CanComputePowerMath(current, max) then
+        self.text:SetText(AbbreviateNumbers and AbbreviateNumbers(current) or tostring(current))
+        self:Show()
+        return
+    end
+
     if self.hideIfEmptyOrFull and (current == 0 or current == max) then
         self:Hide()
     else
         self.text:SetText(F.FormatNumber(current))
-        self:SetWidth(self.text:GetStringWidth())
+        UpdateTextContainerWidth(self)
         self:Show()
     end
 end
@@ -1705,7 +1872,7 @@ local function PowerText_SetFont(self, font, size, outline, shadow)
         self.text:SetShadowColor(0, 0, 0, 0)
     end
 
-    self:SetSize(self.text:GetStringWidth(), size)
+    UpdateTextContainerFontSize(self, size)
 end
 
 local function PowerText_SetPoint(self, point, relativeTo, relativePoint, x, y)
@@ -1754,6 +1921,7 @@ function I.CreatePowerText(parent)
     local powerText = CreateFrame("Frame", parent:GetName().."PowerText", parent.widgets.indicatorFrame)
     parent.indicators.powerText = powerText
     powerText:Hide()
+    powerText.unitButton = parent
 
     local text = powerText:CreateFontString(nil, "OVERLAY", "CELL_FONT_STATUS")
     powerText.text = text
@@ -2067,6 +2235,12 @@ end
 -- shield bar
 -------------------------------------------------
 local function ShieldBar_SetHorizontalValue(bar, percent)
+    if bar.isMidnightStatusBar then
+        bar:SetWidth(bar.parentHealthBar:GetWidth())
+        bar:_SetValue(percent)
+        return
+    end
+
     local maxWidth = bar.parentHealthBar:GetWidth()
     local barWidth
     if percent >= 1 then
@@ -2078,6 +2252,12 @@ local function ShieldBar_SetHorizontalValue(bar, percent)
 end
 
 local function ShieldBar_SetVerticalValue(bar, percent)
+    if bar.isMidnightStatusBar then
+        bar:SetHeight(bar.parentHealthBar:GetHeight())
+        bar:_SetValue(percent)
+        return
+    end
+
     local maxHeight = bar.parentHealthBar:GetHeight()
     local barHeight
     if percent >= 1 then
@@ -2089,6 +2269,16 @@ local function ShieldBar_SetVerticalValue(bar, percent)
 end
 
 local function ShieldBar_SetPoint(bar, point, anchorTo, anchorPoint, x, y)
+    if bar.isMidnightStatusBar then
+        if point == "HEALTH_BAR" then
+            bar:_SetPoint("TOPLEFT", bar.parentHealthBar, P.Scale(-1), P.Scale(1))
+            bar:_SetPoint("BOTTOMLEFT", bar.parentHealthBar, P.Scale(-1), P.Scale(-1))
+        else
+            bar:_SetPoint(point, anchorTo, anchorPoint, x, y)
+        end
+        return
+    end
+
     -- if point == "HEALTH_BAR_HORIZONTAL" then
     --     bar:_SetPoint("TOPLEFT", b.widgets.healthBar)
     --     bar:_SetPoint("BOTTOMLEFT", b.widgets.healthBar)
@@ -2108,15 +2298,30 @@ local function ShieldBar_SetPoint(bar, point, anchorTo, anchorPoint, x, y)
 end
 
 function I.CreateShieldBar(parent)
-    local shieldBar = CreateFrame("Frame", parent:GetName().."ShieldBar", parent.widgets.indicatorFrame, "BackdropTemplate")
+    local shieldBar
+    if Cell.isMidnight then
+        shieldBar = CreateFrame("StatusBar", parent:GetName().."ShieldBar", parent.widgets.indicatorFrame, "BackdropTemplate")
+        shieldBar:SetStatusBarTexture(Cell.vars.whiteTexture)
+        shieldBar:SetMinMaxValues(0, 1)
+        shieldBar._SetValue = shieldBar.SetValue
+        shieldBar.isMidnightStatusBar = true
+    else
+        shieldBar = CreateFrame("Frame", parent:GetName().."ShieldBar", parent.widgets.indicatorFrame, "BackdropTemplate")
+    end
+
     parent.indicators.shieldBar = shieldBar
-    -- shieldBar:SetSize(4, 4)
     shieldBar:Hide()
     shieldBar:SetBackdrop({edgeFile=Cell.vars.whiteTexture, edgeSize=P.Scale(1)})
     shieldBar:SetBackdropBorderColor(0, 0, 0, 1)
 
-    local tex = shieldBar:CreateTexture(nil, "BORDER", nil, -7)
-    tex:SetAllPoints()
+    local tex
+    if Cell.isMidnight then
+        tex = shieldBar:GetStatusBarTexture()
+        tex:SetDrawLayer("BORDER", -7)
+    else
+        tex = shieldBar:CreateTexture(nil, "BORDER", nil, -7)
+        tex:SetAllPoints()
+    end
 
     shieldBar._SetPoint = shieldBar.SetPoint
     shieldBar.SetPoint = ShieldBar_SetPoint
@@ -2125,7 +2330,11 @@ function I.CreateShieldBar(parent)
     shieldBar.parentHealthBar = parent.widgets.healthBar
 
     function shieldBar:SetColor(r, g, b, a)
-        tex:SetColorTexture(r, g, b, a)
+        if self.isMidnightStatusBar then
+            self:SetStatusBarColor(r, g, b, a)
+        else
+            tex:SetColorTexture(r, g, b, a)
+        end
     end
 
     function shieldBar:UpdatePixelPerfect()
