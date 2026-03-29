@@ -585,6 +585,14 @@ local function Dispels_UpdateSize(self, iconsShown)
 end
 
 local dispelOrder = {"Magic", "Curse", "Disease", "Poison", "Bleed"}
+local dispelAtlases = {
+    ["Magic"] = "RaidFrame-Icon-DebuffMagic",
+    ["Curse"] = "RaidFrame-Icon-DebuffCurse",
+    ["Disease"] = "RaidFrame-Icon-DebuffDisease",
+    ["Poison"] = "RaidFrame-Icon-DebuffPoison",
+    ["Bleed"] = "RaidFrame-Icon-DebuffBleed",
+}
+
 local function Dispels_SetDispels(self, dispelTypes)
     local found
     local fallbackHighlight = dispelTypes["_unknown"]
@@ -662,7 +670,12 @@ local function Dispels_SetDispels(self, dispelTypes)
 end
 
 local function Dispels_SetDispel_Blizzard(self, dispelType)
-    self:SetTexture("Interface\\AddOns\\Cell\\Media\\Debuffs\\"..dispelType)
+    local atlas = Cell.isRetail and dispelAtlases[dispelType]
+    if atlas and self.SetAtlas then
+        self:SetAtlas(atlas, true)
+    else
+        self:SetTexture("Interface\\AddOns\\Cell\\Media\\Debuffs\\"..dispelType)
+    end
     self:Show()
 end
 
